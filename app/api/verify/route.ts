@@ -53,6 +53,39 @@ async function fetchWithTimeout(
   }
 }
 
+// Small helper to pause
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+// Retry wrapper for idempotent network calls with exponential backoff
+async function retryFetch(
+  url: string,
+  init: RequestInit & { timeoutMs?: number } = {},
+  attempts = 2
+) {
+  let lastErr: unknown = null
+  for (let i = 0; i < attempts; i++) {
+    try {
+      const res = await fetchWithTimeout(url, init)
+      // If server error, retry; otherwise return response (ok or 4xx)
+      if (res && res.status >= 500 && i < attempts - 1) {
+        await sleep(100 * Math.pow(2, i))
+        continue
+      }
+      return res
+    } catch (e) {
+      lastErr = e
+      if (i < attempts - 1) {
+        await sleep(100 * Math.pow(2, i))
+        continue
+      }
+      throw lastErr
+    }
+  }
+  throw lastErr
+}
+
 function normalize(text: string): string {
   return text
     .toLowerCase()
@@ -179,9 +212,11 @@ async function callDeepSeekJSON(prompt: string): Promise<unknown> {
   const apiKey = process.env.DEEPSEEK_API_KEY
   if (!apiKey) throw new Error("Missing DEEPSEEK_API_KEY")
 
+  const deepseekTimeout = Number(process.env.DEEPSEEK_TIMEOUT_MS) || 30000
+
   const res = await fetchWithTimeout("https://api.deepseek.com/v1/chat/completions", {
     method: "POST",
-    timeoutMs: 120000,
+    timeoutMs: deepseekTimeout,
     headers: {
       "Content-Type": "application/json",
       Authorization: `Bearer ${apiKey}`,
@@ -252,9 +287,10 @@ async function semanticScholarLookup(title: string): Promise<SemanticScholarItem
   })
 
   try {
-    const res = await fetchWithTimeout(
+    const res = await retryFetch(
       `https://api.semanticscholar.org/graph/v1/paper/search/match?${params.toString()}`,
-      { headers: { Accept: "application/json" } }
+      { headers: { Accept: "application/json" }, timeoutMs: 15000 },
+      2
     )
 
     if (!res.ok) return null
@@ -295,10 +331,10 @@ async function arxivLookup(title: string, authors: string[]): Promise<ArxivField
   })
 
   try {
-    const res = await fetchWithTimeout(`https://export.arxiv.org/api/query?${params.toString()}`, {
+    const res = await retryFetch(`https://export.arxiv.org/api/query?${params.toString()}`, {
       timeoutMs: 20000,
       headers: { Accept: "application/atom+xml, text/xml" },
-    })
+    }, 2)
     if (!res.ok) return null
 
     const xml = await res.text()
@@ -360,18 +396,23 @@ function scoreMatchFields(
   return titleScore * 0.7 + authorScore * 0.3
 }
 
-async function verifyCitation(c: Citation, minScore: number) {
-  const ssItem = await semanticScholarLookup(c.title)
+async function verifyCitation(c: Citation, minScore: number, cache?: Map<string, any>) {
+  const key = `${normalize(c.title)}|${normalize((c.authors || []).join(","))}`
+  if (cache?.has(key)) return cache.get(key)
+
+  // Run lookups in parallel to reduce per-citation latency
+  const [ssItem, arxiv] = await Promise.all([
+    semanticScholarLookup(c.title).catch(() => null),
+    arxivLookup(c.title, c.authors).catch(() => null),
+  ])
+
   const ss = extractSemanticScholarFields(ssItem)
   const ssScore = ssItem ? scoreMatchFields(c.title, c.authors, ss.title, ss.authors) : 0
-
-  const arxiv = await arxivLookup(c.title, c.authors)
   const arxivScore = arxiv ? scoreMatchFields(c.title, c.authors, arxiv.title, arxiv.authors) : 0
 
   const score = Math.max(ssScore, arxivScore)
 
   let status: "verified" | "unverified" = score >= minScore ? "verified" : "unverified"
-  
   let sourceUrl: string | null = null
 
   if (status === "verified") {
@@ -379,7 +420,7 @@ async function verifyCitation(c: Citation, minScore: number) {
     else if (arxiv?.arxivId) sourceUrl = `https://arxiv.org/abs/${arxiv.arxivId}`
   }
 
-  return {
+  const result = {
     ref: c,
     score,
     status,
@@ -391,6 +432,9 @@ async function verifyCitation(c: Citation, minScore: number) {
       : null,
     sourceUrl,
   }
+
+  cache?.set(key, result)
+  return result
 }
 
 /* ----------------------------- Route ----------------------------- */
@@ -462,9 +506,14 @@ export async function POST(request: Request) {
     }
 
     // Verify citations with limited concurrency to avoid serverless timeouts
-    const CONCURRENCY = 4
+    const envConcurrency = Number(process.env.VERIFY_LOOKUP_CONCURRENCY ?? 4)
+    const CONCURRENCY = Number.isFinite(envConcurrency) && envConcurrency > 0 ? Math.min(envConcurrency, 20) : 4
+
+    // Per-request in-memory cache to deduplicate lookups for identical citations
+    const lookupCache = new Map<string, any>()
+
     const verifications = await mapWithConcurrency(extracted.citations, CONCURRENCY, async (c) => {
-      return verifyCitation(c, minScore)
+      return verifyCitation(c, minScore, lookupCache)
     })
 
     const verifiedCount = verifications.filter(v => v.status === "verified").length
@@ -486,16 +535,28 @@ export async function POST(request: Request) {
       score: v.score,
     }))
 
-    const { data: inserted, error: insertErr } = await supabase
-      .from("citations")
-      .insert(rows)
-      .select()
+    const BATCH_SIZE = 100
+    const allInserted: any[] = []
+    for (let i = 0; i < rows.length; i += BATCH_SIZE) {
+      const chunk = rows.slice(i, i + BATCH_SIZE)
+      const { data: chunkInserted, error: chunkErr } = await supabase
+        .from("citations")
+        .insert(chunk)
+        .select()
 
-    if (insertErr) {
-      // still update paper status, but report citation insert error
-      await supabase.from("papers").update({ status: "completed", verified_citations: verifiedCount, unverified_citations: unverifiedCount }).eq("id", paper.id)
-      return Response.json({ error: "Saved paper, but failed to save citations", details: insertErr.message }, { status: 500 })
+      if (chunkErr) {
+        // still update paper status, but report citation insert error
+        await supabase
+          .from("papers")
+          .update({ status: "completed", verified_citations: verifiedCount, unverified_citations: unverifiedCount })
+          .eq("id", paper.id)
+        return Response.json({ error: "Saved paper, but failed to save citations", details: chunkErr.message }, { status: 500 })
+      }
+
+      allInserted.push(...(chunkInserted ?? []))
     }
+
+    const inserted = allInserted
 
     // Update paper with final counts
     await supabase
