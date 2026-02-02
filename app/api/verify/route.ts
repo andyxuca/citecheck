@@ -2,6 +2,7 @@
 import { createClient } from "@/lib/supabase/server"
 import { extractText } from "unpdf"
 import { z } from "zod"
+import JSON5 from "json5"
 
 // Ensure Node runtime (Edge may not support some PDF/libs reliably)
 export const runtime = "nodejs"
@@ -284,6 +285,14 @@ function safeParseJSON(text: string): unknown {
   const direct = tryParse(candidate)
   if (direct !== undefined) return direct
 
+  // Try json5 as a tolerant fallback on the raw candidate
+  try {
+    const j5 = JSON5.parse(candidate)
+    if (j5 !== undefined) return j5
+  } catch {
+    // ignore
+  }
+
   // 2) Apply light sanitization heuristics and retry
   let sanitized = candidate
 
@@ -301,6 +310,14 @@ function safeParseJSON(text: string): unknown {
 
   const afterSanitize = tryParse(sanitized)
   if (afterSanitize !== undefined) return afterSanitize
+
+  // Try json5 on sanitized content
+  try {
+    const j5s = JSON5.parse(sanitized)
+    if (j5s !== undefined) return j5s
+  } catch {
+    // ignore
+  }
 
   // 3) Fallback: extract the first JSON object or array block and try sanitizing that
   const objMatch = candidate.match(/\{[\s\S]*\}/)
@@ -321,6 +338,14 @@ function safeParseJSON(text: string): unknown {
 
   const final = tryParse(blockSanitized)
   if (final !== undefined) return final
+
+  // Try json5 on final sanitized block as a last attempt
+  try {
+    const j5f = JSON5.parse(blockSanitized)
+    if (j5f !== undefined) return j5f
+  } catch {
+    // ignore
+  }
 
   if (process.env.VERIFY_DEBUG === "1") {
     const snippet = candidate.slice(0, 2000)
@@ -679,7 +704,7 @@ export async function POST(request: Request) {
       `Extract citations from the references section below.\n` +
       `Return strict JSON only: an object with keys ` +
       `"paperTitle" (string) and "citations" (array of { "title": string, "authors": string[] }).\n` +
-      `No markdown. No extra keys.\n\n` +
+      `No markdown. No extra keys. Return the output as a JSON.\n\n` +
       referencesSection
 
     const raw = await callDeepSeekJSON(prompt)
