@@ -237,6 +237,7 @@ async function callDeepSeekJSON(prompt: string): Promise<unknown> {
     body: JSON.stringify({
       model: "deepseek-chat",
       messages: [{ role: "user", content: prompt }],
+      response_format: { "type": "json_object" },
     }),
   })
 
