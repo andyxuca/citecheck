@@ -266,7 +266,7 @@ async function callDeepSeekJSON(prompt: string): Promise<unknown> {
     return safeParseJSON(content)
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e)
-    throw new Error(`Failed to parse DeepSeek JSON output: ${msg}\nContent preview: ${content.slice(0, 500)}`)
+    throw new Error(`Failed to parse DeepSeek JSON output: ${msg}\nContent: ${content}`)
   }
 }
 
