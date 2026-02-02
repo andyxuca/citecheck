@@ -1,11 +1,10 @@
-// app/api/verify/route.ts - OPTIMIZED VERSION
+// app/api/verify/route.ts - ASYNC BACKGROUND PROCESSING VERSION
 import { createClient } from "@/lib/supabase/server"
 import { extractText } from "unpdf"
 import { z } from "zod"
 
-// Increase function timeout if using Vercel
-export const maxDuration = 60 // 60 seconds (or 300 for Pro plans)
 export const runtime = "nodejs"
+export const maxDuration = 60
 
 /* ----------------------------- Schemas ----------------------------- */
 
@@ -39,12 +38,11 @@ const STOP_LINE_RE = /^(algorithm|figure|table)\s+\d+/i
 
 /* ----------------------------- Helpers ----------------------------- */
 
-// Reduced timeout for faster failures
 async function fetchWithTimeout(
   url: string,
   init: RequestInit & { timeoutMs?: number } = {}
 ) {
-  const { timeoutMs = 10000, ...rest } = init // Reduced from 15000
+  const { timeoutMs = 10000, ...rest } = init
   const controller = new AbortController()
   const t = setTimeout(() => controller.abort(), timeoutMs)
   try {
@@ -63,11 +61,10 @@ function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
-// Reduced retries and faster backoff
 async function retryFetch(
   url: string,
   init: RequestInit & { timeoutMs?: number } = {},
-  attempts = 2 // Reduced from 5
+  attempts = 2
 ) {
   let lastErr: unknown = null
   for (let i = 0; i < attempts; i++) {
@@ -75,7 +72,7 @@ async function retryFetch(
       const res = await fetchWithTimeout(url, init)
       
       if (res && (res.status >= 500 || res.status === 429) && i < attempts - 1) {
-        const backoffMs = 500 * Math.pow(2, i) // Faster backoff: 500ms, 1s
+        const backoffMs = 500 * Math.pow(2, i)
         console.warn(`retryFetch: status ${res.status} for ${url}, attempt ${i + 1}, waiting ${backoffMs}ms`)
         await sleep(backoffMs)
         continue
@@ -211,11 +208,11 @@ async function mapWithConcurrency<T, R>(
 
 /* ----------------------------- DeepSeek ----------------------------- */
 
-async function callDeepSeekJSON(prompt: string, retries = 2): Promise<unknown> { // Reduced retries
+async function callDeepSeekJSON(prompt: string, retries = 2): Promise<unknown> {
   const apiKey = process.env.DEEPSEEK_API_KEY
   if (!apiKey) throw new Error("Missing DEEPSEEK_API_KEY")
 
-  const deepseekTimeout = Number(process.env.DEEPSEEK_TIMEOUT_MS) || 20000 // Reduced from 30000
+  const deepseekTimeout = Number(process.env.DEEPSEEK_TIMEOUT_MS) || 20000
   let lastError: Error | null = null
 
   for (let attempt = 0; attempt < retries; attempt++) {
@@ -328,14 +325,12 @@ type SemanticScholarItem = {
   paperId?: string
 }
 
-// OPTIMIZED: Try one strategy, fail fast
 async function semanticScholarLookup(title: string, authors: string[] = []): Promise<SemanticScholarItem | null> {
   const query = title?.trim()
   if (!query) return null
 
-  const ssTimeout = Number(process.env.SEMANTIC_SCHOLAR_TIMEOUT_MS) || 15000 // Reduced from 25000
+  const ssTimeout = Number(process.env.SEMANTIC_SCHOLAR_TIMEOUT_MS) || 15000
 
-  // Only try match endpoint (most reliable)
   try {
     const params = new URLSearchParams({
       query,
@@ -376,18 +371,17 @@ function extractSemanticScholarFields(item: SemanticScholarItem | null): { title
 
 type ArxivFields = { title: string | null; authors: string[]; arxivId?: string }
 
-// OPTIMIZED: Single strategy only
 async function arxivLookup(title: string, authors: string[]): Promise<ArxivFields | null> {
   const cleanTitle = title?.trim().replace(/[^\w\s]/g, " ").replace(/\s+/g, " ")
   if (!cleanTitle) return null
 
-  const arxivTimeout = Number(process.env.ARXIV_TIMEOUT_MS) || 15000 // Reduced from 30000
+  const arxivTimeout = Number(process.env.ARXIV_TIMEOUT_MS) || 15000
 
   try {
     const params = new URLSearchParams({
       search_query: `ti:"${cleanTitle.replace(/"/g, "")}"`,
       start: "0",
-      max_results: "3", // Reduced from 5
+      max_results: "3",
     })
 
     const res = await retryFetch(
@@ -485,14 +479,12 @@ function scoreMatchFields(
   return titleScore * 0.8 + authorScore * 0.2
 }
 
-// OPTIMIZED: Race condition - return as soon as one succeeds
 async function verifyCitation(c: Citation, minScore: number, cache?: Map<string, any>) {
   const key = `${normalize(c.title)}|${normalize((c.authors || []).join(","))}`
   if (cache?.has(key)) return cache.get(key)
 
-  await sleep(50) // Reduced from 100ms
+  await sleep(50)
 
-  // Run both lookups in parallel with Promise.allSettled (don't wait for failures)
   const [ssResult, arxivResult] = await Promise.allSettled([
     semanticScholarLookup(c.title, c.authors),
     arxivLookup(c.title, c.authors),
@@ -530,6 +522,82 @@ async function verifyCitation(c: Citation, minScore: number, cache?: Map<string,
 
   cache?.set(key, result)
   return result
+}
+
+/* ----------------------------- Background Processing ----------------------------- */
+
+// This function runs AFTER the response is sent to the user
+async function processVerificationsInBackground(
+  paperId: string,
+  citations: Citation[],
+  minScore: number,
+  userId: string
+) {
+  const supabase = await createClient()
+  
+  try {
+    const envConcurrency = Number(process.env.VERIFY_LOOKUP_CONCURRENCY ?? 5)
+    const CONCURRENCY = Number.isFinite(envConcurrency) && envConcurrency > 0 ? Math.min(envConcurrency, 10) : 5
+
+    const lookupCache = new Map<string, any>()
+
+    const verifications = await mapWithConcurrency(citations, CONCURRENCY, async (c) => {
+      return verifyCitation(c, minScore, lookupCache)
+    })
+
+    const verifiedCount = verifications.filter(v => v.status === "verified").length
+    const unverifiedCount = verifications.length - verifiedCount
+
+    const rows = verifications.map(v => ({
+      paper_id: paperId,
+      citation_text: `${v.ref.authors.join(", ")}. ${v.ref.title}`.trim(),
+      authors: v.ref.authors.join(", "),
+      title: v.ref.title,
+      year: null,
+      verification_status: v.status,
+      verification_details:
+        v.status === "verified"
+          ? `Verified (${Math.round(v.score * 100)}%)`
+          : `Unverified (${Math.round(v.score * 100)}%)`,
+      source_url: v.sourceUrl,
+      score: v.score,
+    }))
+
+    const BATCH_SIZE = 100
+    for (let i = 0; i < rows.length; i += BATCH_SIZE) {
+      const chunk = rows.slice(i, i + BATCH_SIZE)
+      const { error: chunkErr } = await supabase
+        .from("citations")
+        .insert(chunk)
+
+      if (chunkErr) {
+        console.error(`Failed to insert citations batch ${i}-${i+BATCH_SIZE}:`, chunkErr)
+      }
+    }
+
+    // Update paper with final counts
+    await supabase
+      .from("papers")
+      .update({
+        status: "completed",
+        verified_citations: verifiedCount,
+        unverified_citations: unverifiedCount,
+      })
+      .eq("id", paperId)
+
+    console.log(`✅ Successfully processed paper ${paperId}: ${verifiedCount} verified, ${unverifiedCount} unverified`)
+  } catch (error) {
+    console.error(`❌ Background processing failed for paper ${paperId}:`, error)
+    
+    // Mark paper as failed
+    await supabase
+      .from("papers")
+      .update({
+        status: "failed",
+        error_message: error instanceof Error ? error.message : "Unknown error during verification"
+      })
+      .eq("id", paperId)
+  }
 }
 
 /* ----------------------------- Route ----------------------------- */
@@ -581,6 +649,7 @@ export async function POST(request: Request) {
       return Response.json({ error: "Could not extract citations from the PDF" }, { status: 400 })
     }
 
+    // Create paper record with "processing" status
     const { data: paper, error: paperError } = await supabase
       .from("papers")
       .insert({
@@ -598,87 +667,23 @@ export async function POST(request: Request) {
       return Response.json({ error: "Failed to save paper" }, { status: 500 })
     }
 
-    // Increased concurrency since we optimized individual lookups
-    const envConcurrency = Number(process.env.VERIFY_LOOKUP_CONCURRENCY ?? 5) // Increased from 2
-    const CONCURRENCY = Number.isFinite(envConcurrency) && envConcurrency > 0 ? Math.min(envConcurrency, 10) : 5
-
-    const lookupCache = new Map<string, any>()
-
-    const verifications = await mapWithConcurrency(extracted.citations, CONCURRENCY, async (c) => {
-      return verifyCitation(c, minScore, lookupCache)
+    // Start background processing (don't await!)
+    processVerificationsInBackground(
+      paper.id,
+      extracted.citations,
+      minScore,
+      user.id
+    ).catch(err => {
+      console.error("Background processing error:", err)
     })
 
-    const verifiedCount = verifications.filter(v => v.status === "verified").length
-    const unverifiedCount = verifications.length - verifiedCount
-
-    const rows = verifications.map(v => ({
-      paper_id: paper.id,
-      citation_text: `${v.ref.authors.join(", ")}. ${v.ref.title}`.trim(),
-      authors: v.ref.authors.join(", "),
-      title: v.ref.title,
-      year: null,
-      verification_status: v.status,
-      verification_details:
-        v.status === "verified"
-          ? `Verified (${Math.round(v.score * 100)}%)`
-          : `Unverified (${Math.round(v.score * 100)}%)`,
-      source_url: v.sourceUrl,
-      score: v.score,
-    }))
-
-    const BATCH_SIZE = 100
-    const allInserted: any[] = []
-    for (let i = 0; i < rows.length; i += BATCH_SIZE) {
-      const chunk = rows.slice(i, i + BATCH_SIZE)
-      const { data: chunkInserted, error: chunkErr } = await supabase
-        .from("citations")
-        .insert(chunk)
-        .select()
-
-      if (chunkErr) {
-        await supabase
-          .from("papers")
-          .update({ status: "completed", verified_citations: verifiedCount, unverified_citations: unverifiedCount })
-          .eq("id", paper.id)
-        return Response.json({ error: "Saved paper, but failed to save citations", details: chunkErr.message }, { status: 500 })
-      }
-
-      allInserted.push(...(chunkInserted ?? []))
-    }
-
-    const inserted = allInserted
-
-    await supabase
-      .from("papers")
-      .update({
-        status: "completed",
-        verified_citations: verifiedCount,
-        unverified_citations: unverifiedCount,
-      })
-      .eq("id", paper.id)
-
-    const citationsOut = (inserted ?? []).map((row: any, idx: number) => {
-      const v = verifications[idx]
-      return {
-        id: row.id,
-        title: v.ref.title,
-        authors: v.ref.authors,
-        text: `${v.ref.authors.join(", ")}. ${v.ref.title}`.trim(),
-        status: v.status,
-        score: v.score,
-        source_url: v.sourceUrl,
-        semantic_scholar: v.semantic_scholar,
-        arxiv: v.arxiv,
-      }
-    })
-
+    // Return immediately with paper info
     return Response.json({
       id: paper.id,
       paper_title: extracted.paperTitle?.trim() || file.name,
       total_citations: extracted.citations.length,
-      verified_count: verifiedCount,
-      unverified_count: unverifiedCount,
-      citations: citationsOut,
+      status: "processing",
+      message: "Citations are being verified in the background. Refresh to see progress.",
       created_at: paper.created_at,
     })
   } catch (error) {
