@@ -254,7 +254,7 @@ async function semanticScholarLookup(title: string): Promise<SemanticScholarItem
   try {
     const res = await fetchWithTimeout(
       `https://api.semanticscholar.org/graph/v1/paper/search/match?${params.toString()}`,
-      { timeoutMs: 15000, headers: { Accept: "application/json" } }
+      { headers: { Accept: "application/json" } }
     )
 
     if (!res.ok) return null
