@@ -10,11 +10,13 @@ export default function DashboardPage() {
   const [isUploading, setIsUploading] = useState(false)
   const [result, setResult] = useState<VerificationResult | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const [uploadMessage, setUploadMessage] = useState<string | null>(null)
 
   const handleUpload = async (file: File) => {
     setIsUploading(true)
     setError(null)
     setResult(null)
+    setUploadMessage(null)
 
     try {
       const formData = new FormData()
@@ -37,12 +39,47 @@ export default function DashboardPage() {
         throw new Error(errorMessage)
       }
 
-      const data = await response.json()
-      setResult(data)
+      // Consume SSE-like stream: lines with `data: {...}\n\n`
+      const reader = response.body?.getReader()
+      if (!reader) throw new Error("No response body")
+
+      const decoder = new TextDecoder()
+      let buffer = ""
+      let done = false
+      while (!done) {
+        const { value, done: d } = await reader.read()
+        done = !!d
+        if (value) {
+          buffer += decoder.decode(value, { stream: true })
+          const parts = buffer.split("\n\n")
+          // Keep last partial
+          buffer = parts.pop() ?? ""
+          for (const part of parts) {
+            const line = part.trim()
+            if (!line) continue
+            // Expect lines like: data: { ... }
+            const m = line.match(/^data:\s*(.*)$/s)
+            if (!m) continue
+            try {
+              const payload = JSON.parse(m[1])
+              if (payload.type === "progress") {
+                setUploadMessage(payload.message ?? null)
+              } else if (payload.type === "result") {
+                setResult(payload.data)
+              } else if (payload.type === "error") {
+                setError(payload.message || "Verification failed")
+              }
+            } catch (e) {
+              // ignore JSON parse errors for partial messages
+            }
+          }
+        }
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : "An error occurred")
     } finally {
       setIsUploading(false)
+      setUploadMessage(null)
     }
   }
 
@@ -55,7 +92,7 @@ export default function DashboardPage() {
         </p>
       </div>
 
-      <PdfUpload onUpload={handleUpload} isUploading={isUploading} />
+      <PdfUpload onUpload={handleUpload} isUploading={isUploading} uploadMessage={uploadMessage} />
 
       {error && (
         <Card className="border-destructive">
