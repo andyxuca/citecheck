@@ -262,23 +262,42 @@ async function callDeepSeekJSON(prompt: string): Promise<unknown> {
     throw new Error("DeepSeek returned empty message.content (no JSON to parse).")
   }
 
-  return safeParseJSON(content)
+  try {
+    return safeParseJSON(content)
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e)
+    throw new Error(`Failed to parse DeepSeek JSON output: ${msg}\nContent preview: ${content.slice(0, 500)}`)
+  }
 }
 
 function safeParseJSON(text: string): unknown {
   const trimmed = (text ?? "").trim()
 
-  // If model still wraps in code fences, strip them.
+  // Strip code fences if present
   const fence = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i)
   const candidate = fence ? fence[1].trim() : trimmed
 
-  // Try parse directly; fallback to extracting first {...} block.
+  // Remove trailing commas (common JSON error)
+  const cleaned = candidate
+    .replace(/,\s*([\]}])/g, '$1') // Remove trailing commas before ] or }
+    .replace(/\s+/g, ' ') // Normalize whitespace
+    .trim()
+
+  // Try parse directly
   try {
-    return JSON.parse(candidate)
-  } catch {
-    const obj = candidate.match(/\{[\s\S]*\}/)
-    if (!obj) throw new Error("Model did not return valid JSON.")
-    return JSON.parse(obj[0])
+    return JSON.parse(cleaned)
+  } catch (firstError) {
+    // Fallback: extract first {...} block
+    const obj = cleaned.match(/\{[\s\S]*\}/)
+    if (!obj) {
+      throw new Error(`Model did not return valid JSON. Original error: ${firstError instanceof Error ? firstError.message : String(firstError)}`)
+    }
+    
+    try {
+      return JSON.parse(obj[0])
+    } catch (secondError) {
+      throw new Error(`Failed to parse extracted JSON object: ${secondError instanceof Error ? secondError.message : String(secondError)}`)
+    }
   }
 }
 
