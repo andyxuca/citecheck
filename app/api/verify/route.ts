@@ -38,7 +38,7 @@ const STOP_LINE_RE = /^(algorithm|figure|table)\s+\d+/i
 
 /* ----------------------------- Helpers ----------------------------- */
 
-// Serverless-safe timeout wrapper
+// Serverless-safe timeout wrapper with better error messages
 async function fetchWithTimeout(
   url: string,
   init: RequestInit & { timeoutMs?: number } = {}
@@ -48,6 +48,11 @@ async function fetchWithTimeout(
   const t = setTimeout(() => controller.abort(), timeoutMs)
   try {
     return await fetch(url, { ...rest, signal: controller.signal })
+  } catch (error) {
+    if (error instanceof Error && error.name === 'AbortError') {
+      throw new Error(`Request timeout after ${timeoutMs}ms for ${url}`)
+    }
+    throw error
   } finally {
     clearTimeout(t)
   }
@@ -58,28 +63,34 @@ function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
-// Retry wrapper for idempotent network calls with exponential backoff
+// Improved retry wrapper with better backoff and error handling
 async function retryFetch(
   url: string,
   init: RequestInit & { timeoutMs?: number } = {},
-  attempts = 4
+  attempts = 5 // Increased from 4
 ) {
   let lastErr: unknown = null
   for (let i = 0; i < attempts; i++) {
     try {
       const res = await fetchWithTimeout(url, init)
-      // If server error, retry; otherwise return response (ok or 4xx)
-      if (res && res.status >= 500 && i < attempts - 1) {
-        console.warn(`retryFetch: server error ${res.status} for ${url}, attempt ${i + 1}`)
-        await sleep(200 * Math.pow(2, i))
+      
+      // If server error or rate limit, retry with exponential backoff
+      if (res && (res.status >= 500 || res.status === 429) && i < attempts - 1) {
+        const backoffMs = Math.min(1000 * Math.pow(2, i), 10000) // Cap at 10s
+        console.warn(`retryFetch: status ${res.status} for ${url}, attempt ${i + 1}, waiting ${backoffMs}ms`)
+        await sleep(backoffMs)
         continue
       }
       return res
     } catch (e) {
       lastErr = e
-      console.warn(`retryFetch: error for ${url} on attempt ${i + 1}: ${e instanceof Error ? e.message : String(e)}`)
+      const msg = e instanceof Error ? e.message : String(e)
+      console.warn(`retryFetch: error for ${url} on attempt ${i + 1}: ${msg}`)
+      
       if (i < attempts - 1) {
-        await sleep(200 * Math.pow(2, i))
+        const backoffMs = Math.min(1000 * Math.pow(2, i), 10000)
+        console.warn(`Retrying after ${backoffMs}ms...`)
+        await sleep(backoffMs)
         continue
       }
       throw lastErr
@@ -278,35 +289,83 @@ type SemanticScholarItem = {
   paperId?: string
 }
 
-async function semanticScholarLookup(title: string): Promise<SemanticScholarItem | null> {
+// Improved Semantic Scholar lookup with multiple fallback strategies
+async function semanticScholarLookup(title: string, authors: string[] = []): Promise<SemanticScholarItem | null> {
   const query = title?.trim()
   if (!query) return null
 
-  const params = new URLSearchParams({
-    query,
-    limit: "1",
-    fields: "title,authors,paperId",
-  })
+  // Increased timeout for better reliability
+  const ssTimeout = Number(process.env.SEMANTIC_SCHOLAR_TIMEOUT_MS) || 25000
 
+  // Strategy 1: Try exact match endpoint first (more reliable)
   try {
-    const ssTimeout = Number(process.env.SEMANTIC_SCHOLAR_TIMEOUT_MS) || 15000
+    const params = new URLSearchParams({
+      query,
+      limit: "1",
+      fields: "title,authors,paperId",
+    })
+
     const res = await retryFetch(
       `https://api.semanticscholar.org/graph/v1/paper/search/match?${params.toString()}`,
-      { headers: { Accept: "application/json" }, timeoutMs: ssTimeout }
+      { 
+        headers: { Accept: "application/json" }, 
+        timeoutMs: ssTimeout 
+      }
     )
 
-    if (!res.ok) return null
-
-    const data = await res.json().catch(() => null)
-    // Python code expects data.get("data", []) and takes [0]
-    const arr = data?.data
-    if (!Array.isArray(arr) || arr.length === 0) return null
-
-    return arr[0] as SemanticScholarItem
-  } catch {
-    // 404 or network error - return null to try arXiv
-    return null
+    if (res.ok) {
+      const data = await res.json().catch(() => null)
+      const arr = data?.data
+      if (Array.isArray(arr) && arr.length > 0) {
+        return arr[0] as SemanticScholarItem
+      }
+    }
+  } catch (e) {
+    console.warn(`Semantic Scholar match endpoint failed: ${e instanceof Error ? e.message : String(e)}`)
   }
+
+  // Strategy 2: Try bulk search endpoint as fallback
+  try {
+    const searchParams = new URLSearchParams({
+      query,
+      limit: "3", // Get more results to find better matches
+      fields: "title,authors,paperId",
+    })
+
+    const res = await retryFetch(
+      `https://api.semanticscholar.org/graph/v1/paper/search?${searchParams.toString()}`,
+      { 
+        headers: { Accept: "application/json" }, 
+        timeoutMs: ssTimeout 
+      }
+    )
+
+    if (res.ok) {
+      const data = await res.json().catch(() => null)
+      const arr = data?.data
+      if (Array.isArray(arr) && arr.length > 0) {
+        // Find best match by title similarity
+        let bestMatch = arr[0]
+        let bestScore = 0
+
+        for (const item of arr) {
+          if (item.title) {
+            const score = sequenceMatcherRatio(normalize(title), normalize(item.title))
+            if (score > bestScore) {
+              bestScore = score
+              bestMatch = item
+            }
+          }
+        }
+
+        return bestMatch as SemanticScholarItem
+      }
+    }
+  } catch (e) {
+    console.warn(`Semantic Scholar search endpoint failed: ${e instanceof Error ? e.message : String(e)}`)
+  }
+
+  return null
 }
 
 function extractSemanticScholarFields(item: SemanticScholarItem | null): { title: string | null; authors: string[]; paperId?: string } {
@@ -320,33 +379,95 @@ function extractSemanticScholarFields(item: SemanticScholarItem | null): { title
 
 type ArxivFields = { title: string | null; authors: string[]; arxivId?: string }
 
+// Improved arXiv lookup with better query construction and parsing
 async function arxivLookup(title: string, authors: string[]): Promise<ArxivFields | null> {
-  const queryParts: string[] = []
-  if (title?.trim()) queryParts.push(`ti:"${title.replace(/"/g, "")}"`)
-  if (authors?.[0]) queryParts.push(`au:"${authors[0].replace(/"/g, "")}"`)
-  if (queryParts.length === 0) return null
+  const cleanTitle = title?.trim().replace(/[^\w\s]/g, " ").replace(/\s+/g, " ")
+  if (!cleanTitle) return null
 
-  const params = new URLSearchParams({
-    search_query: queryParts.join(" AND "),
-    start: "0",
-    max_results: "1",
-  })
+  // Increased timeout for better reliability
+  const arxivTimeout = Number(process.env.ARXIV_TIMEOUT_MS) || 30000
 
+  // Strategy 1: Search by title only (more reliable)
   try {
-    const arxivTimeout = Number(process.env.ARXIV_TIMEOUT_MS) || 20000
-    const res = await retryFetch(`https://export.arxiv.org/api/query?${params.toString()}`, {
-      timeoutMs: arxivTimeout,
-      headers: { Accept: "application/atom+xml, text/xml" },
+    const params = new URLSearchParams({
+      search_query: `ti:"${cleanTitle.replace(/"/g, "")}"`,
+      start: "0",
+      max_results: "5", // Get more results for better matching
     })
-    if (!res.ok) return null
 
-    const xml = await res.text()
+    const res = await retryFetch(
+      `https://export.arxiv.org/api/query?${params.toString()}`,
+      {
+        timeoutMs: arxivTimeout,
+        headers: { Accept: "application/atom+xml, text/xml" },
+      }
+    )
 
-    // Minimal parsing (serverless-safe, no heavy XML deps)
-    // Entry title: the first <entry><title>... (excluding feed title)
-    const entryMatch = xml.match(/<entry>[\s\S]*?<\/entry>/i)
-    if (!entryMatch) return null
-    const entry = entryMatch[0]
+    if (res.ok) {
+      const xml = await res.text()
+      const entries = parseArxivXML(xml)
+      
+      if (entries.length > 0) {
+        // Find best match by title similarity
+        let bestMatch = entries[0]
+        let bestScore = 0
+
+        for (const entry of entries) {
+          if (entry.title) {
+            const score = sequenceMatcherRatio(normalize(title), normalize(entry.title))
+            if (score > bestScore) {
+              bestScore = score
+              bestMatch = entry
+            }
+          }
+        }
+
+        return bestMatch
+      }
+    }
+  } catch (e) {
+    console.warn(`arXiv title search failed: ${e instanceof Error ? e.message : String(e)}`)
+  }
+
+  // Strategy 2: Try with title AND first author if available
+  if (authors?.[0]) {
+    try {
+      const params = new URLSearchParams({
+        search_query: `ti:"${cleanTitle.replace(/"/g, "")}" AND au:"${authors[0].replace(/"/g, "")}"`,
+        start: "0",
+        max_results: "3",
+      })
+
+      const res = await retryFetch(
+        `https://export.arxiv.org/api/query?${params.toString()}`,
+        {
+          timeoutMs: arxivTimeout,
+          headers: { Accept: "application/atom+xml, text/xml" },
+        }
+      )
+
+      if (res.ok) {
+        const xml = await res.text()
+        const entries = parseArxivXML(xml)
+        if (entries.length > 0) {
+          return entries[0]
+        }
+      }
+    } catch (e) {
+      console.warn(`arXiv title+author search failed: ${e instanceof Error ? e.message : String(e)}`)
+    }
+  }
+
+  return null
+}
+
+// Helper to parse multiple arXiv entries
+function parseArxivXML(xml: string): ArxivFields[] {
+  const entries: ArxivFields[] = []
+  const entryMatches = [...xml.matchAll(/<entry>[\s\S]*?<\/entry>/gi)]
+
+  for (const match of entryMatches) {
+    const entry = match[0]
 
     const titleMatch = entry.match(/<title>([\s\S]*?)<\/title>/i)
     const authorMatches = [...entry.matchAll(/<author>[\s\S]*?<name>([\s\S]*?)<\/name>[\s\S]*?<\/author>/gi)]
@@ -360,14 +481,16 @@ async function arxivLookup(title: string, authors: string[]): Promise<ArxivField
       .map(m => m[1]?.replace(/\s+/g, " ").trim())
       .filter((x): x is string => !!x)
 
-    return {
-      title: parsedTitle,
-      authors: parsedAuthors,
-      arxivId: idMatch?.[1],
+    if (parsedTitle) {
+      entries.push({
+        title: parsedTitle,
+        authors: parsedAuthors,
+        arxivId: idMatch?.[1],
+      })
     }
-  } catch {
-    return null
   }
+
+  return entries
 }
 
 /* ----------------------------- Scoring ----------------------------- */
@@ -389,31 +512,44 @@ function scoreMatchFields(
     const foundSet = new Set(foundAuthors.map(normalize).filter(Boolean))
 
     if (refSet.size) {
-      // Python uses exact set intersection; we'll keep it exact for fidelity.
+      // Exact set intersection
       let inter = 0
       for (const a of refSet) if (foundSet.has(a)) inter++
       authorScore = inter / refSet.size
     }
   }
 
-  return titleScore * 0.7 + authorScore * 0.3
+  // Weight title more heavily since it's more reliable
+  return titleScore * 0.8 + authorScore * 0.2
 }
 
 async function verifyCitation(c: Citation, minScore: number, cache?: Map<string, any>) {
   const key = `${normalize(c.title)}|${normalize((c.authors || []).join(","))}`
   if (cache?.has(key)) return cache.get(key)
 
-  // Run lookups in parallel to reduce per-citation latency and capture errors
-  const [ssSettled, arxivSettled] = await Promise.allSettled([
-    semanticScholarLookup(c.title),
-    arxivLookup(c.title, c.authors),
-  ])
+  // Add delay between requests to avoid rate limiting
+  await sleep(100)
 
-  const ssItem = ssSettled.status === "fulfilled" ? ssSettled.value : null
-  const ssError = ssSettled.status === "rejected" ? ssSettled.reason : null
+  let ssItem: SemanticScholarItem | null = null
+  let ssError: any = null
+  let arxiv: ArxivFields | null = null
+  let arxivError: any = null
 
-  const arxiv = arxivSettled.status === "fulfilled" ? arxivSettled.value : null
-  const arxivError = arxivSettled.status === "rejected" ? arxivSettled.reason : null
+  // Try Semantic Scholar first (generally more reliable)
+  try {
+    ssItem = await semanticScholarLookup(c.title, c.authors)
+  } catch (e) {
+    ssError = e
+    console.warn(`Semantic Scholar lookup error for "${c.title}": ${e instanceof Error ? e.message : String(e)}`)
+  }
+
+  // Always try arXiv as well for academic papers
+  try {
+    arxiv = await arxivLookup(c.title, c.authors)
+  } catch (e) {
+    arxivError = e
+    console.warn(`arXiv lookup error for "${c.title}": ${e instanceof Error ? e.message : String(e)}`)
+  }
 
   const ss = extractSemanticScholarFields(ssItem)
   const ssScore = ssItem ? scoreMatchFields(c.title, c.authors, ss.title, ss.authors) : 0
@@ -442,7 +578,7 @@ async function verifyCitation(c: Citation, minScore: number, cache?: Map<string,
     sourceUrl,
   }
 
-  // Optionally include lookup error messages for debugging when enabled
+  // Include lookup errors for debugging
   if (process.env.VERIFY_DEBUG === "1") {
     ;(result as any).lookup_errors = {
       semanticScholar: ssError ? (ssError instanceof Error ? ssError.message : String(ssError)) : null,
@@ -522,9 +658,9 @@ export async function POST(request: Request) {
       return Response.json({ error: "Failed to save paper" }, { status: 500 })
     }
 
-    // Verify citations with limited concurrency to avoid serverless timeouts
-    const envConcurrency = Number(process.env.VERIFY_LOOKUP_CONCURRENCY ?? 4)
-    const CONCURRENCY = Number.isFinite(envConcurrency) && envConcurrency > 0 ? Math.min(envConcurrency, 20) : 4
+    // Reduced concurrency for better reliability (avoid overwhelming APIs)
+    const envConcurrency = Number(process.env.VERIFY_LOOKUP_CONCURRENCY ?? 2)
+    const CONCURRENCY = Number.isFinite(envConcurrency) && envConcurrency > 0 ? Math.min(envConcurrency, 5) : 2
 
     // Per-request in-memory cache to deduplicate lookups for identical citations
     const lookupCache = new Map<string, any>()
