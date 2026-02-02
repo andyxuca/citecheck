@@ -30,215 +30,152 @@ const STOP_HEADINGS = new Set([
   "acknowledgements",
   "supplementary",
   "supplemental",
-  export async function POST(request: Request) {
-    // We'll stream progress updates as SSE-like `data: {...}\n\n` chunks.
-    const stream = new ReadableStream({
-      async start(controller) {
-        const encoder = new TextEncoder()
-        const push = (obj: any) => {
-          try {
-            controller.enqueue(encoder.encode(`data: ${JSON.stringify(obj)}\n\n`))
-          } catch (e) {
-            // ignore
-          }
-        }
+  "algorithm",
+  "proof",
+  "proofs",
+])
+const STOP_LINE_RE = /^(algorithm|figure|table)\s+\d+/i
 
-        const finish = (obj?: any) => {
-          if (obj) push(obj)
-          try { controller.close() } catch (e) {}
-        }
+/* ----------------------------- Helpers ----------------------------- */
 
-        try {
-          const supabase = await createClient()
-          const { data: { user } } = await supabase.auth.getUser()
-          if (!user) {
-            push({ type: 'error', message: 'Unauthorized' })
-            return finish()
-          }
-
-          const formData = await request.formData()
-          const file = formData.get("file") as File | null
-          const minScoreRaw = formData.get("min_score")
-          const minScore = typeof minScoreRaw === "string" ? Number(minScoreRaw) : 0.5
-
-          if (!file || file.type !== "application/pdf") {
-            push({ type: 'error', message: 'Please upload a valid PDF file' })
-            return finish()
-          }
-          if (!Number.isFinite(minScore) || minScore < 0 || minScore > 1) {
-            push({ type: 'error', message: 'min_score must be between 0 and 1' })
-            return finish()
-          }
-
-          push({ type: 'progress', message: 'Extracting PDF text' })
-          // Extract PDF text
-          let fullText = ""
-          try {
-            const bytes = new Uint8Array(await file.arrayBuffer())
-            const out = await extractText(bytes, { mergePages: true })
-            fullText = Array.isArray(out.text) ? out.text.join("\n") : String(out.text ?? "")
-          } catch (e) {
-            push({ type: 'error', message: 'Failed to parse PDF file' })
-            return finish()
-          }
-
-          push({ type: 'progress', message: 'Finding references section' })
-          const referencesSection = findReferencesSection(fullText)
-          if (!referencesSection.trim()) {
-            push({ type: 'error', message: 'Could not find references section in the PDF' })
-            return finish()
-          }
-
-          push({ type: 'progress', message: 'Extracting citations with DeepSeek' })
-          const prompt =
-            `Extract citations from the references section below.\n` +
-            `Return strict JSON only: an object with keys ` +
-            `"paperTitle" (string) and "citations" (array of { "title": string, "authors": string[] }).\n` +
-            `No markdown. No extra keys.\n\n` +
-            referencesSection
-
-          const raw = await callDeepSeekJSON(prompt)
-          const extracted = ExtractedCitationsSchema.parse(raw)
-
-          if (!extracted.citations.length) {
-            push({ type: 'error', message: 'Could not extract citations from the PDF' })
-            return finish()
-          }
-
-          push({ type: 'progress', message: 'Creating paper record' })
-          // Create paper record
-          const { data: paper, error: paperError } = await supabase
-            .from("papers")
-            .insert({
-              user_id: user.id,
-              title: extracted.paperTitle?.trim() || file.name,
-              file_name: file.name,
-              status: "processing",
-              total_citations: extracted.citations.length,
-              verified_citations: 0,
-            })
-            .select()
-            .single()
-
-          if (paperError || !paper) {
-            push({ type: 'error', message: 'Failed to save paper' })
-            return finish()
-          }
-
-          // Verify citations with limited concurrency to avoid serverless timeouts
-          const envConcurrency = Number(process.env.VERIFY_LOOKUP_CONCURRENCY ?? 4)
-          const CONCURRENCY = Number.isFinite(envConcurrency) && envConcurrency > 0 ? Math.min(envConcurrency, 20) : 4
-
-          // Per-request in-memory cache to deduplicate lookups for identical citations
-          const lookupCache = new Map<string, any>()
-
-          push({ type: 'progress', message: 'Verifying citations' })
-          const verifications = await mapWithConcurrency(extracted.citations, CONCURRENCY, async (c, idx) => {
-            // Optionally push per-n N progress updates
-            if (idx % Math.max(1, Math.floor(extracted.citations.length / 4)) === 0) {
-              push({ type: 'progress', message: `Verifying citations (${idx + 1}/${extracted.citations.length})` })
-            }
-            return verifyCitation(c, minScore, lookupCache)
-          })
-
-          const verifiedCount = verifications.filter(v => v.status === "verified").length
-          const unverifiedCount = verifications.length - verifiedCount
-
-          push({ type: 'progress', message: 'Saving citation results' })
-          // Insert citations (batch)
-          const rows = verifications.map(v => ({
-            paper_id: paper.id,
-            citation_text: `${v.ref.authors.join(", ")}. ${v.ref.title}`.trim(),
-            authors: v.ref.authors.join(", "),
-            title: v.ref.title,
-            year: null,
-            verification_status: v.status, // "verified" | "unverified"
-            verification_details:
-              v.status === "verified"
-                ? `Verified (${Math.round(v.score * 100)}%)`
-                : `Unverified (${Math.round(v.score * 100)}%)`,
-            source_url: v.sourceUrl,
-            score: v.score,
-          }))
-
-          const BATCH_SIZE = 100
-          const allInserted: any[] = []
-          for (let i = 0; i < rows.length; i += BATCH_SIZE) {
-            const chunk = rows.slice(i, i + BATCH_SIZE)
-            const { data: chunkInserted, error: chunkErr } = await supabase
-              .from("citations")
-              .insert(chunk)
-              .select()
-
-            if (chunkErr) {
-              // still update paper status, but report citation insert error
-              await supabase
-                .from("papers")
-                .update({ status: "completed", verified_citations: verifiedCount, unverified_citations: unverifiedCount })
-                .eq("id", paper.id)
-              push({ type: 'error', message: 'Saved paper, but failed to save citations' })
-              return finish()
-            }
-
-            allInserted.push(...(chunkInserted ?? []))
-          }
-
-          const inserted = allInserted
-
-          // Update paper with final counts
-          await supabase
-            .from("papers")
-            .update({
-              status: "completed",
-              verified_citations: verifiedCount,
-              unverified_citations: unverifiedCount,
-            })
-            .eq("id", paper.id)
-
-          // Shape response similar to your current route
-          const citationsOut = (inserted ?? []).map((row: any, idx: number) => {
-            const v = verifications[idx]
-            return {
-              id: row.id,
-              title: v.ref.title,
-              authors: v.ref.authors,
-              text: `${v.ref.authors.join(", ")}. ${v.ref.title}`.trim(),
-              status: v.status,
-              score: v.score,
-              source_url: v.sourceUrl,
-              semantic_scholar: v.semantic_scholar,
-              arxiv: v.arxiv,
-            }
-          })
-
-          // Send final result then close stream
-          push({ type: 'result', data: {
-            id: paper.id,
-            paper_title: extracted.paperTitle?.trim() || file.name,
-            total_citations: extracted.citations.length,
-            verified_count: verifiedCount,
-            unverified_count: unverifiedCount,
-            citations: citationsOut,
-            created_at: paper.created_at,
-          } })
-
-          return finish()
-        } catch (error) {
-          const msg = error instanceof Error ? error.message : String(error)
-          try { controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify({ type: 'error', message: msg })}\n\n`)) } catch (e) {}
-          try { controller.close() } catch (e) {}
-        }
-      }
-    })
-
-    return new Response(stream, {
-      headers: {
-        "Content-Type": "text/event-stream",
-        "Cache-Control": "no-cache",
-        Connection: "keep-alive",
-      },
-    })
+// Serverless-safe timeout wrapper
+async function fetchWithTimeout(
+  url: string,
+  init: RequestInit & { timeoutMs?: number } = {}
+) {
+  const { timeoutMs = 15000, ...rest } = init
+  const controller = new AbortController()
+  const t = setTimeout(() => controller.abort(), timeoutMs)
+  try {
+    return await fetch(url, { ...rest, signal: controller.signal })
+  } finally {
+    clearTimeout(t)
   }
+}
+
+// Small helper to pause
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+// Retry wrapper for idempotent network calls with exponential backoff
+async function retryFetch(
+  url: string,
+  init: RequestInit & { timeoutMs?: number } = {},
+  attempts = 4
+) {
+  let lastErr: unknown = null
+  for (let i = 0; i < attempts; i++) {
+    try {
+      const res = await fetchWithTimeout(url, init)
+      // If server error, retry; otherwise return response (ok or 4xx)
+      if (res && res.status >= 500 && i < attempts - 1) {
+        console.warn(`retryFetch: server error ${res.status} for ${url}, attempt ${i + 1}`)
+        await sleep(200 * Math.pow(2, i))
+        continue
+      }
+      return res
+    } catch (e) {
+      lastErr = e
+      console.warn(`retryFetch: error for ${url} on attempt ${i + 1}: ${e instanceof Error ? e.message : String(e)}`)
+      if (i < attempts - 1) {
+        await sleep(200 * Math.pow(2, i))
+        continue
+      }
+      throw lastErr
+    }
+  }
+  throw lastErr
+}
+
+function normalize(text: string): string {
+  return text
+    .toLowerCase()
+    .replace(/[^\w\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+}
+
+/**
+ * Ratcliff/Obershelp similarity (SequenceMatcher-like).
+ * Returns 0..1. This is much closer to difflib.SequenceMatcher().ratio()
+ * than ad-hoc character matching.
+ */
+function sequenceMatcherRatio(aRaw: string, bRaw: string): number {
+  const a = aRaw ?? ""
+  const b = bRaw ?? ""
+  if (!a.length && !b.length) return 1
+  if (!a.length || !b.length) return 0
+
+  // recursive sum of lengths of longest common contiguous substrings
+  const lcsSum = (s1: string, s2: string): number => {
+    const match = longestCommonSubstring(s1, s2)
+    if (!match) return 0
+    const { i, j, len } = match
+    const left = lcsSum(s1.slice(0, i), s2.slice(0, j))
+    const right = lcsSum(s1.slice(i + len), s2.slice(j + len))
+    return len + left + right
+  }
+
+  const matches = lcsSum(a, b)
+  return (2 * matches) / (a.length + b.length)
+}
+
+// O(n*m) LCS (contiguous) search. Fine for typical title lengths.
+function longestCommonSubstring(s1: string, s2: string): { i: number; j: number; len: number } | null {
+  const n = s1.length
+  const m = s2.length
+  let bestLen = 0
+  let bestI = 0
+  let bestJ = 0
+
+  const dp = new Array(m + 1).fill(0)
+  for (let i = 1; i <= n; i++) {
+    let prev = 0
+    for (let j = 1; j <= m; j++) {
+      const tmp = dp[j]
+      if (s1[i - 1] === s2[j - 1]) {
+        dp[j] = prev + 1
+        if (dp[j] > bestLen) {
+          bestLen = dp[j]
+          bestI = i - bestLen
+          bestJ = j - bestLen
+        }
+      } else {
+        dp[j] = 0
+      }
+      prev = tmp
+    }
+  }
+
+  return bestLen > 0 ? { i: bestI, j: bestJ, len: bestLen } : null
+}
+
+function findReferencesSection(text: string): string {
+  const lines = text.split(/\r?\n/)
+  let startIdx: number | null = null
+
+  for (let i = 0; i < lines.length; i++) {
+    if (HEADING_RE.test(lines[i].trim())) {
+      startIdx = i + 1
+      break
+    }
+  }
+  if (startIdx === null) return text
+
+  const collected: string[] = []
+  for (let i = startIdx; i < lines.length; i++) {
+    const line = lines[i]
+    const stripped = line.trim()
+
+    if (!stripped) {
+      collected.push("")
+      continue
+    }
+
+    const heading = stripped.toLowerCase()
+    if (STOP_HEADINGS.has(heading)) break
+    if (STOP_LINE_RE.test(stripped)) break
 
     // "short uppercase heading" stop condition, matching Python
     if (stripped.length <= 40 && stripped === stripped.toUpperCase() && !YEAR_RE.test(stripped)) {
