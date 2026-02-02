@@ -19,7 +19,9 @@ export function PdfUpload({ onUpload, isUploading }: PdfUploadProps) {
   const messages = [
     "Extracting references",
     "Parsing citations",
-    "Verifying citations"
+    "Querying Semantic Scholar",
+    "Checking arXiv",
+    "Saving results",
   ]
 
   useEffect(() => {
