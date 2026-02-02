@@ -1,6 +1,6 @@
 "use client"
 
-import { useState, useCallback } from "react"
+import { useState, useCallback, useEffect } from "react"
 import { useDropzone } from "react-dropzone"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent } from "@/components/ui/card"
@@ -14,6 +14,34 @@ interface PdfUploadProps {
 
 export function PdfUpload({ onUpload, isUploading }: PdfUploadProps) {
   const [selectedFile, setSelectedFile] = useState<File | null>(null)
+  const [messageIdx, setMessageIdx] = useState(0)
+
+  const messages = [
+    "Extracting references",
+    "Parsing citations",
+    "Querying Semantic Scholar",
+    "Checking arXiv",
+    "Saving results",
+  ]
+
+  useEffect(() => {
+    let t: ReturnType<typeof setInterval> | undefined
+    if (isUploading) {
+      setMessageIdx(0)
+      t = setInterval(() => {
+        setMessageIdx((i) => {
+          const next = Math.min(i + 1, messages.length - 1)
+          if (next === messages.length - 1 && t) {
+            clearInterval(t)
+          }
+          return next
+        })
+      }, 14000)
+    } else {
+      setMessageIdx(0)
+    }
+    return () => { if (t) clearInterval(t) }
+  }, [isUploading])
 
   const onDrop = useCallback((acceptedFiles: File[]) => {
     if (acceptedFiles.length > 0) {
@@ -94,7 +122,7 @@ export function PdfUpload({ onUpload, isUploading }: PdfUploadProps) {
                 {isUploading ? (
                   <>
                     <Loader2 className="h-4 w-4 animate-spin" />
-                    Verifying...
+                    <span>{messages[messageIdx]}...</span>
                   </>
                 ) : (
                   "Verify Citations"
