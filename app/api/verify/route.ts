@@ -25,7 +25,7 @@ type Citation = z.infer<typeof CitationSchema>
 // DeepSeek context window limits
 // 64K tokens total (input + output), ~4 chars per token average
 // Reserve tokens for: system prompt (~200), response format (~1000), output (~4000)
-const MAX_INPUT_TOKENS = 1000 // Conservative limit for input
+const MAX_INPUT_TOKENS = 20000 // Conservative limit for input
 const CHARS_PER_TOKEN = 2 // Average estimate
 const MAX_INPUT_CHARS = MAX_INPUT_TOKENS * CHARS_PER_TOKEN
 const CHUNK_OVERLAP_CHARS = 2000 // Overlap to avoid splitting citations mid-text
@@ -309,7 +309,7 @@ async function callDeepSeekJSON(prompt: string): Promise<unknown> {
       Authorization: `Bearer ${apiKey}`,
     },
     body: JSON.stringify({
-      model: "deepseek-chat",
+      model: "deepseek-reasoner",
       messages: [{ role: "user", content: prompt }],
       response_format: { type: "json_object" },
       temperature: 0, // More consistent output
