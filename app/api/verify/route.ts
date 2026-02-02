@@ -62,7 +62,7 @@ function sleep(ms: number) {
 async function retryFetch(
   url: string,
   init: RequestInit & { timeoutMs?: number } = {},
-  attempts = 2
+  attempts = 4
 ) {
   let lastErr: unknown = null
   for (let i = 0; i < attempts; i++) {
@@ -70,14 +70,16 @@ async function retryFetch(
       const res = await fetchWithTimeout(url, init)
       // If server error, retry; otherwise return response (ok or 4xx)
       if (res && res.status >= 500 && i < attempts - 1) {
-        await sleep(100 * Math.pow(2, i))
+        console.warn(`retryFetch: server error ${res.status} for ${url}, attempt ${i + 1}`)
+        await sleep(200 * Math.pow(2, i))
         continue
       }
       return res
     } catch (e) {
       lastErr = e
+      console.warn(`retryFetch: error for ${url} on attempt ${i + 1}: ${e instanceof Error ? e.message : String(e)}`)
       if (i < attempts - 1) {
-        await sleep(100 * Math.pow(2, i))
+        await sleep(200 * Math.pow(2, i))
         continue
       }
       throw lastErr
@@ -287,10 +289,10 @@ async function semanticScholarLookup(title: string): Promise<SemanticScholarItem
   })
 
   try {
+    const ssTimeout = Number(process.env.SEMANTIC_SCHOLAR_TIMEOUT_MS) || 15000
     const res = await retryFetch(
       `https://api.semanticscholar.org/graph/v1/paper/search/match?${params.toString()}`,
-      { headers: { Accept: "application/json" }, timeoutMs: 15000 },
-      2
+      { headers: { Accept: "application/json" }, timeoutMs: ssTimeout }
     )
 
     if (!res.ok) return null
@@ -331,10 +333,11 @@ async function arxivLookup(title: string, authors: string[]): Promise<ArxivField
   })
 
   try {
+    const arxivTimeout = Number(process.env.ARXIV_TIMEOUT_MS) || 20000
     const res = await retryFetch(`https://export.arxiv.org/api/query?${params.toString()}`, {
-      timeoutMs: 20000,
+      timeoutMs: arxivTimeout,
       headers: { Accept: "application/atom+xml, text/xml" },
-    }, 2)
+    })
     if (!res.ok) return null
 
     const xml = await res.text()
@@ -400,11 +403,17 @@ async function verifyCitation(c: Citation, minScore: number, cache?: Map<string,
   const key = `${normalize(c.title)}|${normalize((c.authors || []).join(","))}`
   if (cache?.has(key)) return cache.get(key)
 
-  // Run lookups in parallel to reduce per-citation latency
-  const [ssItem, arxiv] = await Promise.all([
-    semanticScholarLookup(c.title).catch(() => null),
-    arxivLookup(c.title, c.authors).catch(() => null),
+  // Run lookups in parallel to reduce per-citation latency and capture errors
+  const [ssSettled, arxivSettled] = await Promise.allSettled([
+    semanticScholarLookup(c.title),
+    arxivLookup(c.title, c.authors),
   ])
+
+  const ssItem = ssSettled.status === "fulfilled" ? ssSettled.value : null
+  const ssError = ssSettled.status === "rejected" ? ssSettled.reason : null
+
+  const arxiv = arxivSettled.status === "fulfilled" ? arxivSettled.value : null
+  const arxivError = arxivSettled.status === "rejected" ? arxivSettled.reason : null
 
   const ss = extractSemanticScholarFields(ssItem)
   const ssScore = ssItem ? scoreMatchFields(c.title, c.authors, ss.title, ss.authors) : 0
@@ -431,6 +440,14 @@ async function verifyCitation(c: Citation, minScore: number, cache?: Map<string,
       ? { title: arxiv.title, authors: arxiv.authors, score: arxivScore }
       : null,
     sourceUrl,
+  }
+
+  // Optionally include lookup error messages for debugging when enabled
+  if (process.env.VERIFY_DEBUG === "1") {
+    ;(result as any).lookup_errors = {
+      semanticScholar: ssError ? (ssError instanceof Error ? ssError.message : String(ssError)) : null,
+      arXiv: arxivError ? (arxivError instanceof Error ? arxivError.message : String(arxivError)) : null,
+    }
   }
 
   cache?.set(key, result)
