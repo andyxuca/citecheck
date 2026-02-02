@@ -271,14 +271,63 @@ function safeParseJSON(text: string): unknown {
   const fence = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i)
   const candidate = fence ? fence[1].trim() : trimmed
 
-  // Try parse directly; fallback to extracting first {...} block.
-  try {
-    return JSON.parse(candidate)
-  } catch {
-    const obj = candidate.match(/\{[\s\S]*\}/)
-    if (!obj) throw new Error("Model did not return valid JSON.")
-    return JSON.parse(obj[0])
+  // Helper: try parse and return undefined on failure
+  const tryParse = (s: string) => {
+    try {
+      return JSON.parse(s)
+    } catch (_) {
+      return undefined
+    }
   }
+
+  // 1) Try parse directly
+  const direct = tryParse(candidate)
+  if (direct !== undefined) return direct
+
+  // 2) Apply light sanitization heuristics and retry
+  let sanitized = candidate
+
+  // Remove common control characters that break JSON
+  sanitized = sanitized.replace(/[\u0000-\u001f]+/g, "")
+
+  // Remove trailing commas before } or ]
+  sanitized = sanitized.replace(/,\s*(?=[}\]])/g, "")
+
+  // Replace single quotes with double quotes for keys/strings (best-effort)
+  sanitized = sanitized.replace(/'([^']*)'/g, '"$1"')
+
+  // Ensure unquoted object keys become quoted: { key: 1 } -> { "key": 1 }
+  sanitized = sanitized.replace(/([\{,\s])([a-zA-Z0-9_\-]+)\s*:/g, '$1"$2":')
+
+  const afterSanitize = tryParse(sanitized)
+  if (afterSanitize !== undefined) return afterSanitize
+
+  // 3) Fallback: extract the first JSON object or array block and try sanitizing that
+  const objMatch = candidate.match(/\{[\s\S]*\}/)
+  const arrMatch = candidate.match(/\[[\s\S]*\]/)
+  const block = objMatch ? objMatch[0] : arrMatch ? arrMatch[0] : null
+  if (!block) {
+    if (process.env.VERIFY_DEBUG === "1") {
+      const snippet = candidate.slice(0, 2000)
+      throw new Error(`Model did not return valid JSON. First 2000 chars: ${snippet}`)
+    }
+    throw new Error("Model did not return valid JSON.")
+  }
+
+  let blockSanitized = block.replace(/[\u0000-\u001f]+/g, "")
+  blockSanitized = blockSanitized.replace(/,\s*(?=[}\]])/g, "")
+  blockSanitized = blockSanitized.replace(/'([^']*)'/g, '"$1"')
+  blockSanitized = blockSanitized.replace(/([\{,\s])([a-zA-Z0-9_\-]+)\s*:/g, '$1"$2":')
+
+  const final = tryParse(blockSanitized)
+  if (final !== undefined) return final
+
+  if (process.env.VERIFY_DEBUG === "1") {
+    const snippet = candidate.slice(0, 2000)
+    throw new Error(`Model did not return valid JSON after sanitization. First 2000 chars: ${snippet}`)
+  }
+
+  throw new Error("Model did not return valid JSON.")
 }
 
 /* ---------------------- Semantic Scholar + arXiv ---------------------- */
