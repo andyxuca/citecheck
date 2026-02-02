@@ -20,6 +20,16 @@ const ExtractedCitationsSchema = z.object({
 
 type Citation = z.infer<typeof CitationSchema>
 
+/* ----------------------------- Constants ----------------------------- */
+
+// DeepSeek context window limits
+// 64K tokens total (input + output), ~4 chars per token average
+// Reserve tokens for: system prompt (~200), response format (~1000), output (~4000)
+const MAX_INPUT_TOKENS = 58000 // Conservative limit for input
+const CHARS_PER_TOKEN = 4 // Average estimate
+const MAX_INPUT_CHARS = MAX_INPUT_TOKENS * CHARS_PER_TOKEN // ~232K chars
+const CHUNK_OVERLAP_CHARS = 2000 // Overlap to avoid splitting citations mid-text
+
 /* ----------------------------- Regexes ----------------------------- */
 
 const YEAR_RE = /\b(19|20)\d{2}\b/
@@ -219,13 +229,77 @@ async function mapWithConcurrency<T, R>(
   return results
 }
 
+/* ----------------------------- Chunking ----------------------------- */
+
+/**
+ * Split references section into chunks that fit within DeepSeek's token limits.
+ * Tries to split on citation boundaries (blank lines or numbered entries).
+ */
+function chunkReferencesSection(referencesText: string): string[] {
+  // If small enough, return as single chunk
+  if (referencesText.length <= MAX_INPUT_CHARS) {
+    return [referencesText]
+  }
+
+  const chunks: string[] = []
+  const lines = referencesText.split(/\r?\n/)
+  
+  let currentChunk: string[] = []
+  let currentSize = 0
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]
+    const lineSize = line.length + 1 // +1 for newline
+
+    // Check if adding this line would exceed limit
+    if (currentSize + lineSize > MAX_INPUT_CHARS && currentChunk.length > 0) {
+      // Save current chunk
+      chunks.push(currentChunk.join("\n"))
+      
+      // Start new chunk with overlap (last few lines for context)
+      const overlapLines = Math.min(5, currentChunk.length)
+      currentChunk = currentChunk.slice(-overlapLines)
+      currentSize = currentChunk.reduce((sum, l) => sum + l.length + 1, 0)
+    }
+
+    currentChunk.push(line)
+    currentSize += lineSize
+  }
+
+  // Add final chunk
+  if (currentChunk.length > 0) {
+    chunks.push(currentChunk.join("\n"))
+  }
+
+  return chunks
+}
+
+/**
+ * Deduplicate citations by title (case-insensitive).
+ * Keeps first occurrence of each unique title.
+ */
+function deduplicateCitations(citations: Citation[]): Citation[] {
+  const seen = new Set<string>()
+  const unique: Citation[] = []
+
+  for (const cit of citations) {
+    const normalizedTitle = normalize(cit.title)
+    if (!normalizedTitle || seen.has(normalizedTitle)) continue
+    
+    seen.add(normalizedTitle)
+    unique.push(cit)
+  }
+
+  return unique
+}
+
 /* ----------------------------- DeepSeek ----------------------------- */
 
 async function callDeepSeekJSON(prompt: string): Promise<unknown> {
   const apiKey = process.env.DEEPSEEK_API_KEY
   if (!apiKey) throw new Error("Missing DEEPSEEK_API_KEY")
 
-  const deepseekTimeout = Number(process.env.DEEPSEEK_TIMEOUT_MS) || 30000
+  const deepseekTimeout = Number(process.env.DEEPSEEK_TIMEOUT_MS) || 45000 // Increased timeout
 
   const res = await fetchWithTimeout("https://api.deepseek.com/v1/chat/completions", {
     method: "POST",
@@ -237,11 +311,12 @@ async function callDeepSeekJSON(prompt: string): Promise<unknown> {
     body: JSON.stringify({
       model: "deepseek-chat",
       messages: [{ role: "user", content: prompt }],
-      response_format: { "type": "json_object" },
+      response_format: { type: "json_object" },
+      temperature: 0, // More consistent output
+      max_tokens: 4000, // Explicit output limit
     }),
   })
 
-  // Read the body ONCE, then parse. Avoid res.json() then res.text() fallback.
   const rawBody = await res.text().catch(() => "")
 
   if (!rawBody.trim()) {
@@ -262,11 +337,13 @@ async function callDeepSeekJSON(prompt: string): Promise<unknown> {
     throw new Error("DeepSeek returned empty message.content (no JSON to parse).")
   }
 
+  // Add better error context
   try {
     return safeParseJSON(content)
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e)
-    throw new Error(`Failed to parse DeepSeek JSON output: ${msg}\nContent: ${content}`)
+    console.error(`Failed to parse DeepSeek JSON. Error: ${msg}\nContent preview: ${content.slice(0, 500)}`)
+    throw new Error(`Failed to parse DeepSeek JSON output: ${msg}`)
   }
 }
 
@@ -290,14 +367,77 @@ function safeParseJSON(text: string): unknown {
     // Fallback: extract first {...} block
     const obj = cleaned.match(/\{[\s\S]*\}/)
     if (!obj) {
-      throw new Error(`Model did not return valid JSON. Original error: ${firstError instanceof Error ? firstError.message : String(firstError)}`)
+      const msg = firstError instanceof Error ? firstError.message : String(firstError)
+      throw new Error(`Model did not return valid JSON. Original error: ${msg}`)
     }
     
     try {
       return JSON.parse(obj[0])
     } catch (secondError) {
-      throw new Error(`Failed to parse extracted JSON object: ${secondError instanceof Error ? secondError.message : String(secondError)}`)
+      const msg = secondError instanceof Error ? secondError.message : String(secondError)
+      throw new Error(`Failed to parse extracted JSON object: ${msg}`)
     }
+  }
+}
+
+/**
+ * Extract citations from references section, handling chunking if needed.
+ * Returns combined results from all chunks with deduplication.
+ */
+async function extractCitationsFromReferences(
+  referencesSection: string,
+  chunkIndex?: number,
+  totalChunks?: number
+): Promise<{ paperTitle: string; citations: Citation[] }> {
+  const chunks = chunkReferencesSection(referencesSection)
+  
+  console.log(`Processing ${chunks.length} chunk(s) for citation extraction`)
+
+  let allCitations: Citation[] = []
+  let paperTitle = ""
+
+  for (let i = 0; i < chunks.length; i++) {
+    const chunk = chunks[i]
+    
+    // Add chunk context to prompt if multiple chunks
+    const chunkInfo = chunks.length > 1 
+      ? `\n\nNote: This is chunk ${i + 1} of ${chunks.length}. Extract all citations from this section.`
+      : ""
+
+    const prompt =
+      `Extract citations from the references section below.\n` +
+      `You MUST return ONLY valid JSON with NO markdown, NO code fences, NO trailing commas.\n` +
+      `Required format: {"paperTitle": "string", "citations": [{"title": "string", "authors": ["string"]}]}\n` +
+      `Each citation must have a title (non-empty string) and authors (array of strings, may be empty).\n` +
+      `If you cannot determine the paper title, use an empty string.${chunkInfo}\n\n` +
+      chunk
+
+    console.log(`Calling DeepSeek for chunk ${i + 1}/${chunks.length} (${chunk.length} chars)`)
+
+    const raw = await callDeepSeekJSON(prompt)
+    const extracted = ExtractedCitationsSchema.parse(raw)
+
+    // Use paper title from first chunk
+    if (i === 0 && extracted.paperTitle) {
+      paperTitle = extracted.paperTitle
+    }
+
+    allCitations.push(...extracted.citations)
+
+    // Rate limiting: small delay between chunks
+    if (i < chunks.length - 1) {
+      await sleep(1000)
+    }
+  }
+
+  // Deduplicate citations across chunks
+  const uniqueCitations = deduplicateCitations(allCitations)
+  
+  console.log(`Extracted ${allCitations.length} total citations, ${uniqueCitations.length} unique`)
+
+  return {
+    paperTitle,
+    citations: uniqueCitations,
   }
 }
 
@@ -645,16 +785,10 @@ export async function POST(request: Request) {
       return Response.json({ error: "Could not find references section in the PDF" }, { status: 400 })
     }
 
-    // DeepSeek extract citations (paperTitle + citations[])
-    const prompt =
-      `Extract citations from the references section below.\n` +
-      `Return strict JSON only: an object with keys ` +
-      `"paperTitle" (string) and "citations" (array of { "title": string, "authors": string[] }).\n` +
-      `No markdown. No extra keys.\n\n` +
-      referencesSection
+    console.log(`References section: ${referencesSection.length} characters`)
 
-    const raw = await callDeepSeekJSON(prompt)
-    const extracted = ExtractedCitationsSchema.parse(raw)
+    // Extract citations with automatic chunking if needed
+    const extracted = await extractCitationsFromReferences(referencesSection)
 
     if (!extracted.citations.length) {
       return Response.json({ error: "Could not extract citations from the PDF" }, { status: 400 })
