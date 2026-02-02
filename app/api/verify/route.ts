@@ -221,47 +221,75 @@ async function mapWithConcurrency<T, R>(
 
 /* ----------------------------- DeepSeek ----------------------------- */
 
-async function callDeepSeekJSON(prompt: string): Promise<unknown> {
+async function callDeepSeekJSON(prompt: string, retries = 3): Promise<unknown> {
   const apiKey = process.env.DEEPSEEK_API_KEY
   if (!apiKey) throw new Error("Missing DEEPSEEK_API_KEY")
 
   const deepseekTimeout = Number(process.env.DEEPSEEK_TIMEOUT_MS) || 30000
+  let lastError: Error | null = null
 
-  const res = await fetchWithTimeout("https://api.deepseek.com/v1/chat/completions", {
-    method: "POST",
-    timeoutMs: deepseekTimeout,
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${apiKey}`,
-    },
-    body: JSON.stringify({
-      model: "deepseek-chat",
-      messages: [{ role: "user", content: prompt }],
-    }),
-  })
+  for (let attempt = 0; attempt < retries; attempt++) {
+    try {
+      const res = await fetchWithTimeout("https://api.deepseek.com/v1/chat/completions", {
+        method: "POST",
+        timeoutMs: deepseekTimeout,
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${apiKey}`,
+        },
+        body: JSON.stringify({
+          model: "deepseek-chat",
+          messages: [{ role: "user", content: prompt }],
+          response_format: { type: "json_object" }, // Enforce JSON mode
+          temperature: 0.1, // Lower temperature for more consistent output
+        }),
+      })
 
-  // Read the body ONCE, then parse. Avoid res.json() then res.text() fallback.
-  const rawBody = await res.text().catch(() => "")
+      // Read the body ONCE, then parse. Avoid res.json() then res.text() fallback.
+      const rawBody = await res.text().catch(() => "")
 
-  if (!rawBody.trim()) {
-    throw new Error(`DeepSeek returned an empty response body (status ${res.status}).`)
+      if (!rawBody.trim()) {
+        throw new Error(`DeepSeek returned an empty response body (status ${res.status}).`)
+      }
+
+      let data: any
+      try {
+        data = JSON.parse(rawBody)
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e)
+        throw new Error(`DeepSeek response not JSON (${msg}). First 500 chars: ${rawBody.slice(0, 500)}`)
+      }
+
+      const content: string = data?.choices?.[0]?.message?.content ?? ""
+
+      if (!content.trim()) {
+        throw new Error("DeepSeek returned empty message.content (no JSON to parse).")
+      }
+
+      // Try to parse the JSON content
+      const parsed = safeParseJSON(content)
+      
+      // Validate that we got an object (not just any JSON value)
+      if (typeof parsed !== 'object' || parsed === null) {
+        throw new Error("DeepSeek returned valid JSON but not an object")
+      }
+
+      return parsed
+    } catch (e) {
+      lastError = e instanceof Error ? e : new Error(String(e))
+      console.warn(`DeepSeek JSON attempt ${attempt + 1}/${retries} failed: ${lastError.message}`)
+      
+      // Don't retry on the last attempt
+      if (attempt < retries - 1) {
+        // Add exponential backoff between retries
+        const backoffMs = Math.min(1000 * Math.pow(2, attempt), 5000)
+        console.warn(`Retrying DeepSeek call after ${backoffMs}ms...`)
+        await sleep(backoffMs)
+      }
+    }
   }
 
-  let data: any
-  try {
-    data = JSON.parse(rawBody)
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e)
-    throw new Error(`DeepSeek response not JSON (${msg}). First 500 chars: ${rawBody.slice(0, 500)}`)
-  }
-
-  const content: string = data?.choices?.[0]?.message?.content ?? ""
-
-  if (!content.trim()) {
-    throw new Error("DeepSeek returned empty message.content (no JSON to parse).")
-  }
-
-  return safeParseJSON(content)
+  throw lastError || new Error("DeepSeek JSON parsing failed after all retries")
 }
 
 function safeParseJSON(text: string): unknown {
